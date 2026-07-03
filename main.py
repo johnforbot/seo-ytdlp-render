@@ -19,6 +19,14 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI()
+
+@app.get("/")
+def root():
+    return {
+        "status": "working",
+        "service": "yt-dlp Render API"
+    }
+
 TOKEN = os.environ.get("YTDLP_SERVICE_TOKEN", "")
 
 
