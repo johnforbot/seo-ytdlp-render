@@ -1,199 +1,120 @@
 """
-FastAPI wrapper — cobalt.tools + Piped fallback (no yt-dlp, no cookies).
+FastAPI wrapper that proxies YouTube downloads through a self-hosted cobalt instance.
 
 Endpoints
 ---------
-GET  /                           -> status
-GET  /health                     -> 200
-POST /formats  {"url": "..."}    -> JSON metadata + formats
-GET  /download?url=...&format_id=...  -> streams the file
+GET  /health                         -> "ok"
+POST /formats  {"url": "..."}        -> JSON with available quality options
+GET  /download?url=...&format_id=... -> streams the file
 
-Auth header: X-Auth-Token: <YTDLP_SERVICE_TOKEN>
+Auth: every request must send  X-API-Key: <SECRET_KEY>
+Env vars required:
+  SECRET_KEY   - shared secret between this service and your frontend
+  COBALT_URL   - base URL of your self-hosted cobalt (e.g. https://cobalt-xyz.onrender.com)
 """
+
 import os
-import re
-import json
 import requests
-from fastapi import FastAPI, HTTPException, Header, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
+SECRET_KEY = os.environ["SECRET_KEY"]
+COBALT_URL = os.environ["COBALT_URL"].rstrip("/")
+
 app = FastAPI()
-TOKEN = os.environ.get("YTDLP_SERVICE_TOKEN", "")
-
-# Community cobalt instances (rotate if one is down)
-COBALT_INSTANCES = [
-    "https://cobalt-api.ayo.tf",
-    "https://api.cobalt.tools",
-    "https://co.eepy.today",
-]
-
-# Public Piped API instances (fallback for metadata + formats)
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.reallyaweso.me",
-    "https://api.piped.private.coffee",
-]
-
-YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})")
 
 
-def check_auth(header_token):
-    if not TOKEN:
-        raise HTTPException(500, "YTDLP_SERVICE_TOKEN not set")
-    if header_token != TOKEN:
-        raise HTTPException(401, "Bad token")
+def check_auth(x_api_key: str | None):
+    if x_api_key != SECRET_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def extract_video_id(url: str) -> str | None:
-    m = YT_ID_RE.search(url)
-    return m.group(1) if m else None
+def cobalt_request(payload: dict) -> dict:
+    """POST to cobalt and return parsed JSON, or raise 502."""
+    try:
+        r = requests.post(
+            f"{COBALT_URL}/",
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+        )
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"cobalt unreachable: {e}")
 
-
-def piped_get_info(video_id: str):
-    """Try each Piped instance until one works. Returns raw JSON or None."""
-    for base in PIPED_INSTANCES:
-        try:
-            r = requests.get(f"{base}/streams/{video_id}", timeout=15)
-            if r.ok:
-                return r.json(), base
-        except Exception:
-            continue
-    return None, None
-
-
-@app.get("/")
-def root():
-    return {"status": "working", "service": "cobalt + piped API"}
-
-
-@app.api_route("/health", methods=["GET", "HEAD"])
-def health():
-    return Response(status_code=200)
+    if data.get("status") == "error":
+        raise HTTPException(status_code=502, detail=data.get("error", {}).get("code", "cobalt error"))
+    return data
 
 
 class FormatsBody(BaseModel):
     url: str
 
 
+@app.get("/health")
+def health():
+    return "ok"
+
+
 @app.post("/formats")
-def formats(body: FormatsBody, x_auth_token: str | None = Header(default=None)):
-    check_auth(x_auth_token)
-    vid = extract_video_id(body.url)
-    if not vid:
-        raise HTTPException(400, "Could not parse YouTube video ID from URL")
+def formats(body: FormatsBody, x_api_key: str = Header(default=None)):
+    """
+    Cobalt doesn't expose a raw format list like yt-dlp, but it accepts quality hints.
+    We return a fixed menu of qualities the frontend can pick from.
+    """
+    check_auth(x_api_key)
 
-    data, _ = piped_get_info(vid)
-    if not data:
-        raise HTTPException(502, "All Piped instances failed. Try again.")
+    # Quick probe: ask cobalt for the default best to make sure the URL is valid
+    probe = cobalt_request({"url": body.url, "videoQuality": "720"})
+    title = probe.get("filename", "video").rsplit(".", 1)[0]
 
-    formats_out = []
-
-    # Video streams (video-only, mostly)
-    for s in data.get("videoStreams", []) or []:
-        formats_out.append({
-            "format_id": f"v:{s.get('itag')}",
-            "ext": s.get("format", "").lower().replace("mpeg_4", "mp4") or "mp4",
-            "resolution": s.get("quality"),
-            "height": int(re.sub(r"\D", "", s.get("quality") or "0") or 0),
-            "fps": s.get("fps"),
-            "vcodec": s.get("codec"),
-            "acodec": "none" if s.get("videoOnly") else "aac",
-            "filesize": None,
-            "note": "video only" if s.get("videoOnly") else "video + audio",
-            "_url": s.get("url"),
-        })
-
-    # Audio streams
-    for s in data.get("audioStreams", []) or []:
-        formats_out.append({
-            "format_id": f"a:{s.get('itag')}",
-            "ext": s.get("format", "").lower().replace("m4a", "m4a") or "m4a",
-            "resolution": "audio only",
-            "height": 0,
-            "fps": None,
-            "vcodec": "none",
-            "acodec": s.get("codec") or "aac",
-            "filesize": None,
-            "note": f"{s.get('bitrate', '')} audio",
-            "_url": s.get("url"),
-        })
-
-    return JSONResponse({
-        "id": vid,
-        "title": data.get("title"),
-        "thumbnail": data.get("thumbnailUrl"),
-        "duration": data.get("duration"),
-        "uploader": data.get("uploader"),
-        "formats": formats_out,
-    })
-
-
-def cobalt_download_url(url: str) -> str | None:
-    """Ask cobalt for a direct download link. Returns URL or None."""
-    for base in COBALT_INSTANCES:
-        try:
-            r = requests.post(
-                f"{base}/",
-                json={"url": url, "videoQuality": "1080", "filenameStyle": "basic"},
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                timeout=25,
-            )
-            if not r.ok:
-                continue
-            j = r.json()
-            status = j.get("status")
-            if status in ("tunnel", "redirect") and j.get("url"):
-                return j["url"]
-        except Exception:
-            continue
-    return None
+    qualities = [
+        {"format_id": "2160", "label": "4K (2160p) — video+audio"},
+        {"format_id": "1440", "label": "2K (1440p) — video+audio"},
+        {"format_id": "1080", "label": "1080p — video+audio"},
+        {"format_id": "720",  "label": "720p — video+audio"},
+        {"format_id": "480",  "label": "480p — video+audio"},
+        {"format_id": "360",  "label": "360p — video+audio"},
+        {"format_id": "audio","label": "Audio only (mp3)"},
+    ]
+    return JSONResponse({"title": title, "formats": qualities})
 
 
 @app.get("/download")
 def download(
     url: str = Query(...),
-    format_id: str = Query("best"),
-    x_auth_token: str | None = Header(default=None),
+    format_id: str = Query("720"),
+    x_api_key: str = Header(default=None),
 ):
-    check_auth(x_auth_token)
+    check_auth(x_api_key)
 
-    direct_url = None
+    if format_id == "audio":
+        payload = {"url": url, "downloadMode": "audio", "audioFormat": "mp3"}
+    else:
+        payload = {"url": url, "videoQuality": format_id, "filenameStyle": "basic"}
 
-    # Path 1: format_id came from /formats — Piped gave us a direct googlevideo URL.
-    # We need to re-resolve it because those URLs are per-request/short-lived.
-    vid = extract_video_id(url)
-    if vid and format_id and format_id != "best":
-        data, _ = piped_get_info(vid)
-        if data:
-            wanted_itag = format_id.split(":", 1)[-1]
-            for pool in (data.get("videoStreams") or [], data.get("audioStreams") or []):
-                for s in pool:
-                    if str(s.get("itag")) == wanted_itag:
-                        direct_url = s.get("url")
-                        break
-                if direct_url:
-                    break
+    data = cobalt_request(payload)
 
-    # Path 2: no match or format_id=best → use cobalt for a merged file
-    if not direct_url:
-        direct_url = cobalt_download_url(url)
+    # cobalt returns either { status: "tunnel"|"redirect", url: "..." } or { status: "picker", picker: [...] }
+    dl_url = data.get("url")
+    if not dl_url:
+        # picker case (rare on YouTube) — take the first item
+        picker = data.get("picker") or []
+        if picker:
+            dl_url = picker[0].get("url")
+    if not dl_url:
+        raise HTTPException(status_code=502, detail="cobalt returned no download url")
 
-    if not direct_url:
-        raise HTTPException(502, "No provider returned a download URL")
+    filename = data.get("filename", "download")
 
-    # Stream the file to the client
-    upstream = requests.get(direct_url, stream=True, timeout=30)
-    if not upstream.ok:
-        raise HTTPException(502, f"Upstream fetch failed: {upstream.status_code}")
+    # Stream cobalt's file back to the client
+    upstream = requests.get(dl_url, stream=True, timeout=60)
+    if upstream.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"upstream {upstream.status_code}")
 
-    def gen():
-        try:
-            for chunk in upstream.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
-
-    return StreamingResponse(gen(), media_type="application/octet-stream")
+    return StreamingResponse(
+        upstream.iter_content(chunk_size=64 * 1024),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
