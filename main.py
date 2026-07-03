@@ -41,9 +41,11 @@ class FormatsBody(BaseModel):
     url: str
 
 
-@app.get("/health")
+from fastapi import Response
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return {"ok": True}
+    return Response(status_code=200)
 
 
 @app.post("/formats")
